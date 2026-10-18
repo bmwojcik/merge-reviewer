@@ -1,0 +1,12 @@
+# path-in-this-repo path-in-project
+# Optional leading [stack] limits a line to that Stack value (magento2, shopify, generic).
+# .cursor/hooks.json is linked only when the project has no hooks.json of its own.
+cursor/skills/review-change .cursor/skills/review-change
+cursor/skills/apply-review-fixes .cursor/skills/apply-review-fixes
+cursor/skills/skip-review-fixes .cursor/skills/skip-review-fixes
+cursor/agents/project-reviewer.md .cursor/agents/project-reviewer.md
+cursor/commands/apply-review.md .cursor/commands/apply-review.md
+cursor/commands/skip-review.md .cursor/commands/skip-review.md
+cursor/hooks.json .cursor/hooks.json
+cursor/hooks/apply-review-on-open.py .cursor/hooks/apply-review-on-open.py
+cursor/extensions/review-apply .cursor/extensions/review-apply

@@ -1,0 +1,41 @@
+{
+  "name": "review-apply",
+  "displayName": "review apply",
+  "description": "Open the review-change canvas as a rendered panel and paste apply/skip skills from canvas buttons.",
+  "publisher": "review",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:review.pasteApply",
+    "onCommand:review.pasteSkip",
+    "onCommand:review.openCanvas",
+    "onUri"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "review.pasteApply",
+        "title": "Paste apply-review-fixes into current chat"
+      },
+      {
+        "command": "review.pasteSkip",
+        "title": "Paste skip-review-fixes into current chat"
+      },
+      {
+        "command": "review.openCanvas",
+        "title": "Open review-change canvas"
+      }
+    ]
+  }
+}

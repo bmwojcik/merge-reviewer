@@ -1,0 +1,38 @@
+{
+  "verdict": "request-changes",
+  "summary": "An empty name is returned unchanged.",
+  "reviewed": [
+    {
+      "path": "src/widget.py",
+      "findings": [
+        {
+          "anchor": "return name",
+          "severity": "blocking",
+          "category": "empty-name",
+          "note": "An empty name should fall back to a guest label."
+        }
+      ]
+    }
+  ],
+  "not_reviewed": [],
+  "files": [
+    {
+      "path": "src/widget.py",
+      "replacements": [
+        {
+          "old": "    return name",
+          "new": "    return name or \"guest\""
+        }
+      ]
+    }
+  ],
+  "mr": {
+    "title": "Fall back when the widget name is empty",
+    "body": "Return a guest label when the caller passes an empty name."
+  },
+  "demo": {
+    "sha": "a1b2c3d",
+    "subject": "Return a guest label when the name is empty",
+    "branch": "feature/widget-label"
+  }
+}
