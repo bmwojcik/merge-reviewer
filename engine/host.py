@@ -48,6 +48,9 @@ _ENV_KEYS = {
     "REVIEW_CHANGE_PHPUNIT",
     "REVIEW_CHANGE_RETRY",
     "REVIEW_CHANGE_UNIT_CMD",
+    "REVIEW_CHANGE_HOST",
+    "REVIEW_CHANGE_OPEN",
+    "REVIEW_CHANGE_CLAUDE_TIMEOUT",
     "MERGE_REVIEWER_HOME",
     "CURSOR_TEMPLATE_HOME",
 }
@@ -613,7 +616,7 @@ def review_once(repo: Path, prompt: str, model: str, output: Path | None = None)
     return False
 
 
-def spawn_background(repo: Path, model: str) -> int:
+def spawn_background(repo: Path, model: str, host: str = "cursor") -> int:
     from datetime import datetime
 
     from engine.canvas import canvas_path, write_pending_canvas
@@ -624,12 +627,21 @@ def spawn_background(repo: Path, model: str) -> int:
     started = datetime.now().strftime("%H:%M:%S")
     stop_previous(repo)
     branch_scope = os.environ.get("REVIEW_CHANGE_SCOPE", "commit").strip().lower() == "branch"
-    write_pending_canvas(repo, sha, subject, branch, started, branch_scope=branch_scope)
+    if host == "claude":
+        from engine import report
+
+        report.write_pending_report(repo, sha, subject, branch, started, branch_scope)
+        report.write_status(
+            repo, "running", sha=sha, subject=subject, branch=branch, started_at=started, model=model
+        )
+    else:
+        write_pending_canvas(repo, sha, subject, branch, started, branch_scope=branch_scope)
     log = repo / "var" / "review-change.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(f"merge-reviewer: {sha} {started} {subject}\n", encoding="utf-8")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["REVIEW_CHANGE_HOST"] = host  # the child carries the decision, not CLAUDECODE
     if model:
         env["REVIEW_CHANGE_MODEL"] = model
     cmd = [sys.executable, "-u", str(review_bin()), "--run"]
@@ -648,6 +660,12 @@ def spawn_background(repo: Path, model: str) -> int:
     tell(f"merge-reviewer: started pid {child.pid}")
     tell(f"merge-reviewer: commit  {sha}  {subject}")
     tell(f"merge-reviewer: model   {model}")
-    tell(f"merge-reviewer: canvas  {canvas_path(repo)}")
+    if host == "claude":
+        from engine import report
+
+        tell("merge-reviewer: host    claude")
+        tell(f"merge-reviewer: report  {report.html_path(repo)}")
+    else:
+        tell(f"merge-reviewer: canvas  {canvas_path(repo)}")
     tell(f"merge-reviewer: log     {log}")
     return 0

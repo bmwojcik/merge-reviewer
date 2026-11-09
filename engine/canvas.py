@@ -414,10 +414,8 @@ def _identity(repo: Path, meta: dict) -> tuple[str, str, str]:
     )
 
 
-def render_canvas_tsx(repo: Path, merged: dict, meta: dict | None = None) -> str:
-    meta = meta or {}
-    sha, subject, branch = _identity(repo, meta)
-    ui = review_ui(repo)
+def verdict_view(ui: dict[str, str], merged: dict) -> tuple[str, str | None, bool, str]:
+    """(label, tone, incomplete, verdict) for a merged analysis."""
     verdict_labels = {
         "approve": (ui["approve"], _VERDICT_TONE["approve"]),
         "approve-with-nits": (ui["approve_nits"], _VERDICT_TONE["approve-with-nits"]),
@@ -425,17 +423,15 @@ def render_canvas_tsx(repo: Path, merged: dict, meta: dict | None = None) -> str
         "too-large": (ui["too_large"], "warning"),
     }
     verdict = str(merged.get("verdict") or "").strip()
-    incomplete = verdict not in verdict_labels
-    if incomplete:
-        label, tone = (ui["incomplete"], "danger")
-    else:
-        label, tone = verdict_labels[verdict]
-    skipped = [str(item).strip() for item in merged.get("not_reviewed") or [] if str(item).strip()]
-    if not incomplete and verdict == "approve" and skipped:
-        label, tone = (ui["approve_partial"], "warning")
-    summary = str(merged.get("summary") or "").strip()
-    blocking: list[tuple[str, str]] = []
-    nits: list[tuple[str, str]] = []
+    if verdict not in verdict_labels:
+        return ui["incomplete"], "danger", True, verdict
+    label, tone = verdict_labels[verdict]
+    return label, tone, False, verdict
+
+
+def collect_findings(merged: dict) -> list[dict]:
+    """Every finding that has text, in file order: path, anchor, category, note, blocking."""
+    found: list[dict] = []
     for item in merged.get("reviewed") or []:
         path = str((item or {}).get("path") or "")
         for finding in (item or {}).get("findings") or []:
@@ -447,7 +443,36 @@ def render_canvas_tsx(repo: Path, merged: dict, meta: dict | None = None) -> str
             if not note:
                 continue
             severity = str(finding.get("severity") or "").lower()
-            (blocking if severity.startswith("block") else nits).append((path, note))
+            found.append(
+                {
+                    "path": path,
+                    "anchor": str(finding.get("anchor") or "").strip(),
+                    "category": str(finding.get("category") or "").strip(),
+                    "note": note,
+                    "blocking": severity.startswith("block"),
+                }
+            )
+    return found
+
+
+def split_findings(merged: dict) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    blocking: list[tuple[str, str]] = []
+    nits: list[tuple[str, str]] = []
+    for item in collect_findings(merged):
+        (blocking if item["blocking"] else nits).append((item["path"], item["note"]))
+    return blocking, nits
+
+
+def render_canvas_tsx(repo: Path, merged: dict, meta: dict | None = None) -> str:
+    meta = meta or {}
+    sha, subject, branch = _identity(repo, meta)
+    ui = review_ui(repo)
+    label, tone, incomplete, verdict = verdict_view(ui, merged)
+    skipped = [str(item).strip() for item in merged.get("not_reviewed") or [] if str(item).strip()]
+    if not incomplete and verdict == "approve" and skipped:
+        label, tone = (ui["approve_partial"], "warning")
+    summary = str(merged.get("summary") or "").strip()
+    blocking, nits = split_findings(merged)
     count_tone = "danger" if blocking else ("warning" if nits else None)
     body: list[str] = []
     body.append("    <Stack gap={24} style={{ padding: 24, maxWidth: 920 }}>")

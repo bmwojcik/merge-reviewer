@@ -50,7 +50,13 @@ from engine.paths import (
     tell,
 )
 from engine.pre_review import run_pre_review
-from engine.project import load_review_project, version_older
+from engine.project import (
+    DEFAULT_CLAUDE_MODEL,
+    configured_review_host,
+    load_review_project,
+    resolve_review_host,
+    version_older,
+)
 from engine.verify import verify_proposed_fixes
 
 SKIP_SUBJECT_MARKERS = ("[skip review]", "[skip review-change]")
@@ -67,7 +73,12 @@ def argv_value(flag: str) -> str:
     return ""
 
 
-def resolve_model(repo: Path | None = None) -> str:
+def review_host(repo: Path) -> str:
+    """cursor or claude for this run (env, laptop file, config, then Agent host)."""
+    return resolve_review_host(load_review_project(repo))
+
+
+def resolve_model(repo: Path | None = None, host: str = "cursor") -> str:
     cli = argv_value("--model")
     if cli:
         return cli
@@ -76,8 +87,12 @@ def resolve_model(repo: Path | None = None) -> str:
         return env
     if repo is not None:
         project = load_review_project(repo)
+        if host == "claude":
+            return project.claude_model or DEFAULT_CLAUDE_MODEL
         if project.model:
             return project.model
+    if host == "claude":
+        return DEFAULT_CLAUDE_MODEL
     return "grok-4.7"
 
 
@@ -125,7 +140,9 @@ def warn_version(repo: Path) -> str:
     return ""
 
 
-def build_analysis_prompt(repo: Path, base: str, paths: list[str], scope: str, context: ReviewContext) -> str:
+def build_analysis_prompt(
+    repo: Path, base: str, paths: list[str], scope: str, context: ReviewContext, host: str = "cursor"
+) -> str:
     ui = review_ui(repo)
     project = load_review_project(repo)
     lang = ui["note_language"]
@@ -141,10 +158,16 @@ def build_analysis_prompt(repo: Path, base: str, paths: list[str], scope: str, c
         "No docs/features/INDEX.md and no docs/notes matched. Review the diff alone.\n"
     )
     # Docs, rules, and the diff are concatenated so braces in source are literal.
+    rendered = "report" if host == "claude" else "canvas"
+    persona = (
+        "You are a fresh project-reviewer. Its rules are in your system prompt."
+        if host == "claude"
+        else "You are a fresh project-reviewer. Apply `.cursor/agents/project-reviewer.md`."
+    )
     head = f"""MODE: preview (one analysis for this commit)
-INTENT: analyse {sha} and emit JSON only. The script renders the canvas. Do not render it.
+INTENT: analyse {sha} and emit JSON only. The script renders the {rendered}. Do not render it.
 You review the whole in-scope set in one pass. There is no second model and no split.
-You are a fresh project-reviewer. Apply `.cursor/agents/project-reviewer.md`.
+{persona}
 The reading budget below overrides any instruction to discover docs.
 Do not resume any previous session.
 
@@ -157,7 +180,7 @@ Do not resume any previous session.
 - Open at most one existing source file, and only if a hunk's contract is not in the diff.
 - Finish in a few turns.
 
-Do not write the canvas. Do not edit var/review-change.fixes.json or last.json.
+Do not write the {rendered}. Do not edit var/review-change.fixes.json or last.json.
 Create or edit no other file.
 Write summary, each finding note, and mr.title / mr.body in {lang}.
 Write ONLY {out} as JSON (no prose, no code fence):
@@ -233,11 +256,16 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m {secs}s" if minutes else f"{secs}s"
 
 
-def run_analysis(repo: Path, prompt: str, model: str, paths: list[str]) -> bool:
-    from engine.host import review_once
-
+def run_analysis(repo: Path, prompt: str, model: str, paths: list[str], host: str = "cursor") -> bool:
     out = analysis_file(repo)
-    review_once(repo, prompt, model, out)
+    if host == "claude":
+        from engine.claude_host import run_claude
+
+        run_claude(repo, prompt, model, out)
+    else:
+        from engine.host import review_once
+
+        review_once(repo, prompt, model, out)
     if not out.is_file():
         record_failed_analysis(repo, paths, "no analysis output")
         log_line("analysis: no output — files stay not_reviewed")
@@ -245,7 +273,74 @@ def run_analysis(repo: Path, prompt: str, model: str, paths: list[str]) -> bool:
     return True
 
 
-def _publish_too_large(repo: Path, base: str, scope: str, paths: list[str], reason: str, started: float, sha: str, subject: str) -> None:
+def _idle(
+    repo: Path, host: str, sha: str, subject: str, pill: str, note: str, state: str = "idle", **status: object
+) -> None:
+    if host == "claude":
+        from engine import report
+
+        report.write_idle_report(repo, sha, subject, pill, note)
+        report.write_status(
+            repo, state, sha=sha, subject=subject, label=pill, note=note, finished_epoch=time.time(), **status
+        )
+    else:
+        write_idle_canvas(repo, sha, subject, pill, note)
+
+
+def _count_findings(merged: dict) -> tuple[int, int]:
+    from engine.canvas import collect_findings
+
+    found = collect_findings(merged)
+    blocking = sum(1 for item in found if item["blocking"])
+    return blocking, len(found) - blocking
+
+
+def _publish_report(
+    repo: Path, merged: dict, meta: dict, state: str, sha: str, subject: str, branch: str, **status: object
+) -> None:
+    from engine import report
+    from engine.canvas import collect_findings, review_ui, verdict_view
+
+    report.write_report(repo, merged, meta)
+    label, _tone, _incomplete, verdict = verdict_view(review_ui(repo), merged)
+    blocking, nits = _count_findings(merged)
+    fix_files = sum(1 for item in merged.get("files") or [] if (item or {}).get("replacements"))
+    report.write_status(
+        repo,
+        state,
+        sha=sha,
+        subject=subject,
+        branch=branch,
+        verdict=verdict,
+        label=label,
+        summary=str(merged.get("summary") or "")[:300],
+        blocking=blocking,
+        nits=nits,
+        fix_files=fix_files,
+        top_blocking=[
+            f"{item['path']}: {item['note']}"[:240]
+            for item in collect_findings(merged)
+            if item["blocking"]
+        ][:5],
+        finished_epoch=time.time(),
+        **status,
+    )
+    log_line(f"wrote {report.html_path(repo).name} and {report.md_path(repo).name}")
+
+
+def _publish_too_large(
+    repo: Path,
+    base: str,
+    scope: str,
+    paths: list[str],
+    reason: str,
+    started: float,
+    sha: str,
+    subject: str,
+    host: str = "cursor",
+    branch: str = "",
+    started_epoch: float = 0.0,
+) -> None:
     clear_last(repo)
     clear_analysis(repo)
     record_too_large(repo, paths, reason)
@@ -255,6 +350,16 @@ def _publish_too_large(repo: Path, base: str, scope: str, paths: list[str], reas
     finished = datetime.now().strftime("%H:%M:%S")
     elapsed = _format_elapsed(time.monotonic() - started)
     ui = review_ui(repo)
+    if host == "claude":
+        try:
+            _publish_report(
+                repo, merged, {"finished": finished, "elapsed": elapsed}, "done", sha, subject, branch,
+                started_epoch=started_epoch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"report render failed: {exc}")
+            _idle(repo, host, sha, subject, ui["too_large"], reason, "failed", started_epoch=started_epoch)
+        return
     try:
         write_canvas(repo, merged, {"finished": finished, "elapsed": elapsed})
         log_line(f"wrote {CANVAS_NAME} (script)")
@@ -271,6 +376,8 @@ def run() -> int:
     project = load_review_project(repo)
     if not project.enabled:
         return 0
+    host = resolve_review_host(project)
+    started_epoch = time.time()
     warning = warn_version(repo)
     if warning:
         log_line(warning)
@@ -284,8 +391,9 @@ def run() -> int:
     started_at = datetime.now().strftime("%H:%M:%S")
     started = time.monotonic()
     ui = review_ui(repo)
-    model = resolve_model(repo)
-    prime_triggers(repo)
+    model = resolve_model(repo, host)
+    if host != "claude":
+        prime_triggers(repo)
     base = detect_base(repo)
     scope = scope_ref(repo, base)
     work = work_set(repo, base, scope)
@@ -296,7 +404,7 @@ def run() -> int:
     )
     if not in_scope:
         log_line("nothing changed since the last verified pass — no review")
-        write_idle_canvas(repo, sha, subject, ui["no_changes"], ui["no_changes_note"])
+        _idle(repo, host, sha, subject, ui["no_changes"], ui["no_changes_note"], started_epoch=started_epoch)
         return 0
     entries = work["ledger"].get("entries") or {}
     if not isinstance(entries, dict):
@@ -313,11 +421,13 @@ def run() -> int:
     if decision in {"too-large", "skip-too-large"}:
         reason = too_large_reason(size, limit)
         log_line(reason)
-        _publish_too_large(repo, base, scope, paths, reason, started, sha, subject)
+        _publish_too_large(
+            repo, base, scope, paths, reason, started, sha, subject, host, branch, started_epoch
+        )
         return 0
     if decision == "skip-failed":
         log_line(FAILED_RETRY_LOG)
-        write_idle_canvas(repo, sha, subject, ui["retry_hold"], ui["retry_note"])
+        _idle(repo, host, sha, subject, ui["retry_hold"], ui["retry_note"], started_epoch=started_epoch)
         return 0
     pre_status = ""
     if project.pre_review:
@@ -327,15 +437,26 @@ def run() -> int:
     else:
         log_line("pre-review: skip (empty command)")
     branch_scope = os.environ.get("REVIEW_CHANGE_SCOPE", "commit").strip().lower() == "branch"
-    write_pending_canvas(repo, sha, subject, branch, started_at, pre_status, branch_scope)
+    if host == "claude":
+        from engine import report
+
+        report.write_pending_report(repo, sha, subject, branch, started_at, branch_scope)
+        report.write_status(
+            repo, "running", sha=sha, subject=subject, branch=branch, started_at=started_at,
+            started_epoch=started_epoch, model=model,
+        )
+    else:
+        write_pending_canvas(repo, sha, subject, branch, started_at, pre_status, branch_scope)
     clear_last(repo)
     clear_analysis(repo)
     context = build_context(repo, base, scope, project)
     brief = write_brief(repo, context)
     log_line(f"brief {brief.name}")
-    prompt = build_analysis_prompt(repo, base, paths, scope, context)
+    prompt = build_analysis_prompt(repo, base, paths, scope, context, host)
     log_line(f"analysing commit {sha} model={model} prompt_bytes={len(prompt.encode('utf-8'))}")
-    ok = run_analysis(repo, prompt, model, paths)
+    if host == "claude":
+        log_line("review host: claude")
+    ok = run_analysis(repo, prompt, model, paths, host)
     if analysis_file(repo).is_file():
         try:
             verify_proposed_fixes(repo, log=log_line)
@@ -358,11 +479,31 @@ def run() -> int:
     )
     if not ok:
         log_line("analysis failed — same blobs are skipped unless REVIEW_CHANGE_RETRY=1")
-        write_idle_canvas(repo, sha, subject, ui["incomplete_pill"], ui["incomplete_note"])
+        _idle(
+            repo, host, sha, subject, ui["incomplete_pill"], ui["incomplete_note"], "failed",
+            started_epoch=started_epoch,
+        )
         return 0
     finished = datetime.now().strftime("%H:%M:%S")
     elapsed = _format_elapsed(time.monotonic() - started)
     log_line(f"finished {finished} — took {elapsed}")
+    if host == "claude":
+        try:
+            _publish_report(
+                repo, merged,
+                {"finished": finished, "elapsed": elapsed, "pre_review": pre_status, "model": model},
+                "done", sha, subject, branch, started_epoch=started_epoch,
+            )
+            from engine import report
+
+            report.open_report(report.html_path(repo))
+        except Exception as exc:  # noqa: BLE001 - never fail git
+            log_line(f"report render failed: {exc}")
+            _idle(
+                repo, host, sha, subject, ui["incomplete_pill"], ui["incomplete_note"], "failed",
+                started_epoch=started_epoch,
+            )
+        return 0
     try:
         write_canvas(
             repo,
@@ -389,7 +530,8 @@ def dry_run(repo: Path) -> int:
     work = work_set(repo, base, scope)
     paths = list(work["in_scope"])
     context = build_context(repo, base, scope, project)
-    prompt = build_analysis_prompt(repo, base, paths, scope, context)
+    host = resolve_review_host(project)
+    prompt = build_analysis_prompt(repo, base, paths, scope, context, host)
     ui = review_ui(repo)
     source = (
         ".agent-tools/config.md"
@@ -407,7 +549,18 @@ def dry_run(repo: Path) -> int:
         print("labels: " + " / ".join(project.labels))
     else:
         print(f"labels: {ui['approve']} / {ui['approve_nits']} / {ui['request_changes']}")
-    print(f"model: {resolve_model(repo)}")
+    print(f"model: {resolve_model(repo, host)}")
+    print(f"agent_host: {project.agent_host}")
+    print(f"review_host_setting: {configured_review_host(project)}")
+    print(f"review_host: {host}")
+    print(f"claude_model: {project.claude_model or DEFAULT_CLAUDE_MODEL}")
+    if host == "claude":
+        from engine.claude_host import claude_binary
+        from engine.report import html_path, md_path
+
+        print(f"claude_cli: {claude_binary() or '(missing)'}")
+        print(f"report_html: {html_path(repo)}")
+        print(f"report_md: {md_path(repo)}")
     print(f"base: {base}")
     print(f"scope: {scope}")
     print(f"in_scope: {len(paths)}")
@@ -421,7 +574,8 @@ def dry_run(repo: Path) -> int:
     print(f"git_host: {host or '(empty)'}")
     print(f"git_project: {git_project or '(empty)'}")
     print(f"new_mr_url_sample: {new_mr_url(repo) or '(empty)'}")
-    print("trigger_dirs: " + ", ".join(str(path) for path in extra_trigger_dirs(repo)))
+    if host != "claude":
+        print("trigger_dirs: " + ", ".join(str(path) for path in extra_trigger_dirs(repo)))
     print("test_paths: " + ",".join(project.test_paths))
     if context.test_edits:
         print("test_edits: " + "; ".join(context.test_edits))
@@ -475,6 +629,16 @@ def run_demo() -> int:
         return 1
     meta = dict(payload.get("demo") or {})
     meta["demo"] = True
+    if os.environ.get("REVIEW_CHANGE_HOST", "").strip().lower() == "claude":
+        from engine import report
+
+        meta.setdefault("finished", "12:00:00")
+        meta.setdefault("elapsed", "42s")
+        meta.setdefault("model", DEFAULT_CLAUDE_MODEL)
+        report.write_report(demo, payload, meta)
+        print(f"report: {report.html_path(demo)}")
+        print(f"markdown: {report.md_path(demo)}")
+        return 0
     body = render_canvas_tsx(demo, payload, meta)
     from engine.canvas import canvas_paths_for_repo
 
@@ -495,6 +659,9 @@ def main() -> int:
     from engine.host import load_cursor_env, prime_triggers, push_and_open_mr, spawn_background
 
     try:
+        cli_host = argv_value("--host").lower()
+        if cli_host in {"auto", "cursor", "claude"}:
+            os.environ["REVIEW_CHANGE_HOST"] = cli_host
         if "--version" in sys.argv:
             print(package_version())
             return 0
@@ -528,7 +695,8 @@ def main() -> int:
         if reason:
             tell(f"merge-reviewer: skip ({reason})")
             return 0
-        return spawn_background(repo, resolve_model(repo))
+        host = resolve_review_host(project)
+        return spawn_background(repo, resolve_model(repo, host), host)
     except Exception as exc:  # noqa: BLE001 — the hook must not fail the commit
         if any(flag in sys.argv for flag in ("--dry-run", "--demo", "--version", "--prime-triggers")):
             tell(f"merge-reviewer: {exc}")

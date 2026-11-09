@@ -20,13 +20,13 @@ If none exist it prints `merge-reviewer: engine not found (set MERGE_REVIEWER_HO
 
 ## What gets linked
 
-`install/links.txt` lists `path-in-this-repo path-in-project`. A leading `[stack]` limits the line to that **Stack** value. The linker creates absolute symlinks. It refuses to replace a real file unless `--force`, and prints `conflict`.
+`install/links.txt` lists `path-in-this-repo path-in-project`. A leading `[stack]` limits the line to that **Stack** value. A leading `[host:cursor]` or `[host:claude]` limits it to a project whose **Agent host** (or `link-project.sh --host`) includes that host; the link of a host that is no longer wanted is removed when this repository owns it. The linker creates absolute symlinks. It refuses to replace a real file unless `--force`, and prints `conflict`.
 
-Each `.cursor/skills/<name>` link is also created at `.claude/skills/<name>` so Claude Code can run apply and skip. Claude Code still cannot render the canvas.
+Claude Code gets `.claude/skills/review-change` (the Claude version), `.claude/skills/apply-review-fixes`, `.claude/skills/skip-review-fixes`, and `.claude/agents/project-reviewer.md`. Each points straight into this repository. Nothing under `.claude/commands` and no `.claude/settings.json` is created or edited. The Claude Code hooks are merged into `.claude/settings.local.json` (see the README); a project's own committed `.claude/settings.json` is left alone. Claude Code cannot render the canvas; the Claude host writes `var/review-change.html` and `.md`.
 
 `.cursor/hooks.json` is reviewer-only (`{"version": 1, "hooks": {}}`). If the project already has a `hooks.json` that is not our symlink, the linker leaves it and prints `ok`. Merge the empty hooks object by hand if the project needs both. The companion `.cursor/hooks/apply-review-on-open.py` is a no-op stdin stub; canvas buttons are handled by the `review-apply` extension, not by that hook.
 
-The linker also writes three real files (not symlinks):
+For a project whose host includes Cursor, the linker also writes three real files (not symlinks; they are removed when the host narrows to claude):
 
 - `.cursor/review-change.apply.request`
 - `.cursor/review-change.skip.request`
@@ -46,14 +46,17 @@ A bullet value is empty when it is `none`, `empty`, `(empty)`, `REPLACE_ME`, sta
 
 `<git-dir>/agent-tools.local` with `- **Merge reviewer:** off` disables the reviewer on this laptop. The hook still starts the engine; the engine exits without a review. The same key in `PROJECT.md` or `config.md` is ignored, and the engine logs that. `--check` prints `opted_out`. The local file stays inside `.git` and is not added to the exclude block.
 
-It refreshes a managed block in `.git/info/exclude`:
+It refreshes a managed block in the repository's `info/exclude` (shared by linked worktrees):
 
 ```text
 # >>> merge-reviewer
 …linked paths…
+.claude/settings.local.json
 var/review-change.*
 # <<< merge-reviewer
 ```
+
+The refresh keeps every existing line whose path still exists in some worktree of the repository, so two worktrees linked for different hosts do not remove each other's entries.
 
 Links are local. Do not commit them.
 

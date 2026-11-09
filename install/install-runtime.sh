@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Laptop runtime: agent CLI, cursor-sdk, review-apply extension, dashboard key.
-# Writes MERGE_REVIEWER_HOME into ~/.config/review-change/cursor.env.
-# Never prints the key.
+# Laptop runtime. Writes MERGE_REVIEWER_HOME into ~/.config/review-change/cursor.env.
+# Never prints a key.
+#   cursor (default): agent CLI, cursor-sdk, review-apply extension, dashboard key.
+#   claude: checks the claude CLI and that it is logged in. Nothing is installed or
+#           stored; no Cursor key is asked for.
+#   both: all of the above.
 #
-#   bash install/install-runtime.sh
+#   bash install/install-runtime.sh [--host cursor|claude|both]
 #   bash install/install-runtime.sh --non-interactive
 set -u
 
@@ -14,15 +17,29 @@ DASHBOARD_URL="https://cursor.com/dashboard/integrations"
 NONINTERACTIVE=0
 SHELL_RC=""
 
-for arg in "$@"; do
+HOST=cursor
+while [ "$#" -gt 0 ]; do
+  arg=$1
+  shift
   case "$arg" in
     --non-interactive|-y) NONINTERACTIVE=1 ;;
+    --host=*) HOST=${arg#--host=} ;;
+    --host)
+      [ "$#" -gt 0 ] || { printf 'error: --host needs cursor, claude, or both\n' >&2; exit 2; }
+      HOST=$1
+      shift
+      ;;
     --help|-h)
-      sed -n '1,12p' "$0"
+      sed -n '1,14p' "$0"
       exit 0
       ;;
   esac
 done
+case "$HOST" in
+  cursor|claude|both) ;;
+  *) printf 'error: --host must be cursor, claude, or both\n' >&2; exit 2 ;;
+esac
+host_has() { [ "$HOST" = both ] || [ "$HOST" = "$1" ]; }
 
 if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
   SHELL_RC="$HOME/.zshrc"
@@ -197,27 +214,63 @@ install_extension() {
   fi
 }
 
-ensure_path
-install_agent_cli || true
-login_agent
-install_cursor_sdk
+check_claude() {
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+  esac
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "claude CLI not found. Install Claude Code (https://code.claude.com/docs/en/setup), then re-run."
+    return 1
+  fi
+  log "claude CLI: $(claude --version 2>/dev/null | head -n 1)"
+  # Read-only status check. Only the loggedIn flag is looked at; nothing is printed from it.
+  if claude auth status 2>/dev/null | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'; then
+    log "claude session: logged in"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    log "claude session: ANTHROPIC_API_KEY is set (API billing)"
+  else
+    warn "claude is not logged in. Run: claude  (then /login)"
+    return 1
+  fi
+}
+
+CLAUDE_OK=skipped
+if host_has claude; then
+  if check_claude; then CLAUDE_OK=ok; else CLAUDE_OK=problem; fi
+fi
+
+if host_has cursor; then
+  ensure_path
+  install_agent_cli || true
+  login_agent
+  install_cursor_sdk
+fi
 upsert_env MERGE_REVIEWER_HOME "$ROOT"
 log "MERGE_REVIEWER_HOME written"
-prompt_api_key || true
-source_env_from_shell
-install_extension
+if host_has cursor; then
+  prompt_api_key || true
+  source_env_from_shell
+  install_extension
+fi
 
 log ""
-log "=== merge-reviewer runtime ==="
-log "agent: $(command -v agent 2>/dev/null || echo missing)"
-if python3 -c 'import cursor_sdk' 2>/dev/null; then
-  log "sdk: installed"
-else
-  log "sdk: missing"
+log "=== merge-reviewer runtime (host: $HOST) ==="
+if host_has cursor; then
+  log "agent: $(command -v agent 2>/dev/null || echo missing)"
+  if python3 -c 'import cursor_sdk' 2>/dev/null; then
+    log "sdk: installed"
+  else
+    log "sdk: missing"
+  fi
+  if [ -n "${CURSOR_API_KEY:-}" ] && is_crsr_key "$CURSOR_API_KEY"; then
+    log "api key: present"
+  else
+    log "api key: missing"
+  fi
+  log "Reload the Cursor window after linking a project."
 fi
-if [ -n "${CURSOR_API_KEY:-}" ] && is_crsr_key "$CURSOR_API_KEY"; then
-  log "api key: present"
-else
-  log "api key: missing"
+if host_has claude; then
+  log "claude: $(command -v claude 2>/dev/null || echo missing) ($CLAUDE_OK)"
+  log "Link projects with: bash install/link-project.sh <project> --host $HOST"
 fi
-log "Reload the Cursor window after linking a project."

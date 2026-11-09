@@ -9,6 +9,7 @@ On/off is `<git-dir>/agent-tools.local`, not a committed file.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,10 @@ _EMPTY_VALUES = {"", "none", "leave empty", "-", "—", "–", "(empty)", "empty
 _POLISH = {"polish", "polski", "pl"}
 _OFF = {"off", "false", "no", "0", "disabled"}
 _STACKS = {"magento2", "shopify", "generic"}
+AGENT_HOSTS = ("cursor", "claude", "both")
+REVIEW_HOSTS = ("auto", "cursor", "claude")
+DEFAULT_CLAUDE_MODEL = "sonnet"
+_HOST_FROM_AGENT = {"cursor": "cursor", "claude": "claude", "both": "auto"}
 DEFAULT_TEST_PATHS = ("**/Test/**", "**/tests/**", "**/test/**")
 AGENT_RULES_BUDGET = 8_000
 LEGACY_SETTINGS_LOG = (
@@ -55,6 +60,9 @@ class ReviewProject:
     skip_branches: tuple[str, ...] = ()
     base_suffixes: tuple[tuple[str, str], ...] = ()
     legacy_base: str = ""
+    agent_host: str = "both"
+    review_host: str = ""
+    claude_model: str = ""
 
 
 def _is_explanatory_comment(text: str) -> bool:
@@ -197,6 +205,20 @@ def is_opted_out(repo: Path) -> bool:
     return fields.get("merge reviewer", "").strip().lower() in _OFF
 
 
+def _choice(raw: str, allowed: tuple[str, ...]) -> str:
+    """The value when it is exactly one allowed word; otherwise empty."""
+    value = raw.strip().lower()
+    return value if value in allowed else ""
+
+
+def local_fields(repo: Path) -> dict[str, str]:
+    """Bullets of `<git-dir>/agent-tools.local` (laptop-only overrides)."""
+    directory = git_dir(repo)
+    if directory is None:
+        return {}
+    return _fields(_read_text(directory / "agent-tools.local"))
+
+
 def _section(text: str, heading: str) -> str:
     lines = text.splitlines()
     start: int | None = None
@@ -289,6 +311,16 @@ def load_review_project(repo: Path) -> ReviewProject:
     test_raw = fields.get("test paths", "")
     test_paths = _parse_csv(test_raw) if test_raw else DEFAULT_TEST_PATHS
     opted_out = is_opted_out(repo)
+    local = local_fields(repo)
+    agent_host = (
+        _choice(local.get("agent host", ""), AGENT_HOSTS)
+        or _choice(fields.get("agent host", ""), AGENT_HOSTS)
+        or "both"
+    )
+    review_host = _choice(local.get("review host", ""), REVIEW_HOSTS) or _choice(
+        fields.get("review host", ""), REVIEW_HOSTS
+    )
+    claude_model = local.get("claude review model", "") or fields.get("claude review model", "")
     return ReviewProject(
         stack=_normalize_stack(stack_raw),
         enabled=not opted_out,
@@ -311,4 +343,23 @@ def load_review_project(repo: Path) -> ReviewProject:
         skip_branches=_parse_csv(fields.get("skip branches", "")),
         base_suffixes=_parse_suffixes(fields.get("git base suffixes", "")),
         legacy_base=_legacy_base(_strip_html_comments(settings_text)),
+        agent_host=agent_host,
+        review_host=review_host,
+        claude_model=claude_model,
     )
+
+
+def configured_review_host(project: ReviewProject) -> str:
+    """auto, cursor, or claude: env, then agent-tools.local / config, then Agent host."""
+    env = _choice(os.environ.get("REVIEW_CHANGE_HOST", ""), REVIEW_HOSTS)
+    if env:
+        return env
+    return project.review_host or _HOST_FROM_AGENT[project.agent_host]
+
+
+def resolve_review_host(project: ReviewProject) -> str:
+    """cursor or claude. `auto` is claude inside Claude Code (CLAUDECODE=1), else cursor."""
+    host = configured_review_host(project)
+    if host == "auto":
+        return "claude" if os.environ.get("CLAUDECODE", "").strip() == "1" else "cursor"
+    return host

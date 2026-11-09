@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- Claude Code host. One headless `claude -p` (default model `sonnet`, **Claude review model**) writes the same analysis JSON; `engine/report.py` renders `var/review-change.html` and `var/review-change.md` with the same labels and language as the canvas, and a running placeholder first. No Cursor key is needed.
+- New keys `Agent host` (`cursor|claude|both`), `Review host` (`auto|cursor|claude`), and `Claude review model`, all overridable in `<git-dir>/agent-tools.local`. New env `REVIEW_CHANGE_HOST`, `REVIEW_CHANGE_OPEN`, `REVIEW_CHANGE_CLAUDE_TIMEOUT`, `REVIEW_CHANGE_REPORT_DIR`; new flag `--host`. `auto` picks claude when `CLAUDECODE=1`.
+- `claude/` directory: `review-change` skill, `project-reviewer` agent, and the `review-status.py` hook that announces a finished review once per session and notes a started one after `git commit`.
+- `link-project.sh --host cursor|claude|both`, `[host:...]` filters in `links.txt`, removal of owned links when the host narrows, hook merge into `.claude/settings.local.json` (tagged entries only), and a worktree-safe exclude block. `.claude/skills/review-change` is now the Claude version instead of the Cursor one.
+- `install-runtime.sh --host` (default `cursor`): `claude` checks the CLI and its login only.
+- The headless Claude runs in an empty temp directory with `--add-dir <repo>`, git spelled `git -C <repo> ...`, and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` removed from its env, so no project `CLAUDE.md`, rules, or skills reach it. The log line now includes `cache_creation_input_tokens`.
+- The Cursor path is unchanged: same prompt, canvas, triggers, and extension.
+
 ## 0.3.0
 
 - When Agent layer is committed, the analysis prompt includes the local tool symlinks, Keep local paths, and vendored paths. A tracked file replaced by one of those symlinks is not treated as lost, and the script marks that deletion reviewed with no notes.

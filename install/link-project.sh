@@ -1,10 +1,13 @@
 #!/bin/sh
 # Link this engine into a project. Links are absolute and must not be committed.
-# Usage: install/link-project.sh <project-root> [--check|--unlink|--force]
+# Usage: install/link-project.sh <project-root> [--host cursor|claude|both] [--check|--unlink|--force]
+# Host: --host, else "Agent host" in <git-dir>/agent-tools.local, else in
+# .agent-tools/config.md, else both. Narrowing the host removes the links this
+# repo owns for the dropped host.
 set -eu
 
 usage() {
-    printf '%s\n' "usage: install/link-project.sh <project-root> [--check|--unlink|--force]" >&2
+    printf '%s\n' "usage: install/link-project.sh <project-root> [--host cursor|claude|both] [--check|--unlink|--force]" >&2
     exit 2
 }
 
@@ -12,12 +15,21 @@ REVIEWER=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 MODE=install
 FORCE=0
 ROOT=""
+HOST=""
 
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
     case "$arg" in
         --check) MODE=check ;;
         --unlink) MODE=unlink ;;
         --force) FORCE=1 ;;
+        --host=*) HOST=${arg#--host=} ;;
+        --host)
+            [ "$#" -gt 0 ] || usage
+            HOST=$1
+            shift
+            ;;
         --help|-h) usage ;;
         *)
             if [ -n "$ROOT" ]; then
@@ -27,6 +39,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+case "$HOST" in
+    ""|cursor|claude|both) ;;
+    *) usage ;;
+esac
 
 [ -n "$ROOT" ] || usage
 [ -d "$ROOT" ] || {
@@ -87,7 +103,41 @@ else:
 PY
 }
 
+resolve_host() {
+    python3 - "$REVIEWER" "$ROOT" 2>/dev/null <<'PY' || printf '%s\n' both
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from engine.project import load_review_project
+
+print(load_review_project(Path(sys.argv[2])).agent_host)
+PY
+}
+
 STACK=$(project_stack)
+if [ -z "$HOST" ]; then
+    HOST=$(resolve_host)
+fi
+case "$HOST" in
+    cursor|claude|both) ;;
+    *) HOST=both ;;
+esac
+
+host_has() {
+    [ "$HOST" = both ] || [ "$HOST" = "$1" ]
+}
+
+# True when dest is a symlink this repo created (absolute target inside this repo).
+owned_link() {
+    [ -L "$1" ] || return 1
+    target=$(readlink "$1" 2>/dev/null || true)
+    case "$target" in
+        "$REVIEWER"/*) return 0 ;;
+    esac
+    return 1
+}
+
 PROBLEMS=0
 DESTS=""
 
@@ -121,7 +171,7 @@ link_one() {
     fi
     src_abs=$(abs_path "$src")
     if [ "$MODE" = "unlink" ]; then
-        if [ -L "$dest" ] && same_link "$dest" "$src_abs"; then
+        if owned_link "$dest"; then
             rm -f "$dest"
             printf '%s %s\n' "removed" "$dest_rel"
         fi
@@ -131,6 +181,15 @@ link_one() {
         printf '%s %s\n' "ok" "$dest_rel"
         note_dest "$dest_rel"
         return 0
+    fi
+    if owned_link "$dest"; then
+        # Ours but pointing elsewhere in this repo (an older layout): repoint it.
+        if [ "$MODE" = "check" ]; then
+            printf '%s %s\n' "stale" "$dest_rel"
+            PROBLEMS=$((PROBLEMS + 1))
+            return 0
+        fi
+        rm -f "$dest"
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
         if [ "$dest_rel" = ".cursor/hooks.json" ] && [ ! -L "$dest" ] && [ "$FORCE" -eq 0 ]; then
@@ -158,13 +217,18 @@ link_one() {
     note_dest "$dest_rel"
 }
 
-claude_for() {
+# A link of a host that is no longer wanted: remove it when this repo owns it.
+drop_stale() {
     dest_rel=$1
-    case "$dest_rel" in
-        .cursor/skills/*)
-            printf '%s\n' ".claude/skills/${dest_rel#.cursor/skills/}"
-            ;;
-    esac
+    dest=$ROOT/$dest_rel
+    owned_link "$dest" || return 0
+    if [ "$MODE" = "check" ]; then
+        printf '%s %s\n' "stale" "$dest_rel"
+        PROBLEMS=$((PROBLEMS + 1))
+        return 0
+    fi
+    rm -f "$dest"
+    printf '%s %s\n' "removed" "$dest_rel"
 }
 
 while IFS= read -r line || [ -n "$line" ]; do
@@ -180,16 +244,23 @@ while IFS= read -r line || [ -n "$line" ]; do
             rest=${line#*] }
             ;;
     esac
-    if [ -n "$filter" ] && [ "$filter" != "$STACK" ]; then
-        continue
-    fi
     src_rel=${rest%% *}
     dest_rel=${rest#* }
+    case "$filter" in
+        host:*)
+            if [ "$MODE" != "unlink" ] && ! host_has "${filter#host:}"; then
+                drop_stale "$dest_rel"
+                continue
+            fi
+            ;;
+        "") ;;
+        *)
+            if [ "$filter" != "$STACK" ]; then
+                continue
+            fi
+            ;;
+    esac
     link_one "$src_rel" "$dest_rel"
-    extra=$(claude_for "$dest_rel" || true)
-    if [ -n "$extra" ]; then
-        link_one "$src_rel" "$extra"
-    fi
 done < "$LINKS"
 
 write_trigger() {
@@ -231,61 +302,60 @@ write_trigger() {
     printf '%s %s\n' "ok" "$rel"
 }
 
-write_trigger ".cursor/review-change.apply.request" "apply"
-write_trigger ".cursor/review-change.skip.request" "skip"
-write_trigger ".cursor/review-change.mr.request" "mr"
-
-refresh_exclude() {
-    exclude=$ROOT/.git/info/exclude
-    if [ ! -d "$ROOT/.git" ]; then
-        return 0
-    fi
-    mkdir -p "$ROOT/.git/info"
-    [ -f "$exclude" ] || : > "$exclude"
-    tmp=$(mktemp)
-    awk '
-        $0 == "# >>> merge-reviewer" { skip = 1; next }
-        $0 == "# <<< merge-reviewer" { skip = 0; next }
-        skip == 0 { print }
-    ' "$exclude" > "$tmp"
-    if [ "$MODE" != "unlink" ]; then
-        {
-            printf '%s\n' "# >>> merge-reviewer"
-            for rel in $DESTS \
-                .cursor/review-change.apply.request \
-                .cursor/review-change.skip.request \
-                .cursor/review-change.mr.request
-            do
-                printf '%s\n' "$rel"
-            done
-            printf '%s\n' "var/review-change.*"
-            printf '%s\n' "# <<< merge-reviewer"
-        } >> "$tmp"
-    fi
-    mv "$tmp" "$exclude"
+# Cursor-only trigger files. Without the cursor host they are removed (never created).
+cursor_triggers() {
+    write_trigger ".cursor/review-change.apply.request" "apply"
+    write_trigger ".cursor/review-change.skip.request" "skip"
+    write_trigger ".cursor/review-change.mr.request" "mr"
 }
 
-if [ "$MODE" = "check" ]; then
-    refresh_exclude() { :; }
+if host_has cursor; then
+    cursor_triggers
+elif [ "$MODE" = "install" ]; then
+    MODE=unlink
+    cursor_triggers
+    MODE=install
 fi
 
-refresh_exclude
+refresh_exclude() {
+    if [ "$MODE" = "unlink" ]; then
+        python3 "$REVIEWER/install/exclude-block.py" "$ROOT" unlink
+        return 0
+    fi
+    # Union with lines other worktrees of this repo still need (shared info/exclude).
+    set -- $DESTS
+    if host_has cursor; then
+        set -- "$@" \
+            .cursor/review-change.apply.request \
+            .cursor/review-change.skip.request \
+            .cursor/review-change.mr.request
+    fi
+    if host_has claude; then
+        set -- "$@" .claude/settings.local.json
+    fi
+    python3 "$REVIEWER/install/exclude-block.py" "$ROOT" install "$@" "var/review-change.*"
+}
 
-prune_empty() {
-    for dir in \
-        "$ROOT/.cursor/skills" \
-        "$ROOT/.cursor/agents" \
-        "$ROOT/.cursor/commands" \
-        "$ROOT/.cursor/extensions" \
-        "$ROOT/.cursor/hooks" \
-        "$ROOT/.cursor" \
-        "$ROOT/.claude/skills" \
-        "$ROOT/.claude"
-    do
+prune_dirs() {
+    for dir in "$@"; do
         if [ -d "$dir" ]; then
             rmdir "$dir" 2>/dev/null || true
         fi
     done
+}
+
+prune_cursor() {
+    prune_dirs "$ROOT/.cursor/skills" "$ROOT/.cursor/agents" "$ROOT/.cursor/commands" \
+        "$ROOT/.cursor/extensions" "$ROOT/.cursor/hooks" "$ROOT/.cursor"
+}
+
+prune_claude() {
+    prune_dirs "$ROOT/.claude/skills" "$ROOT/.claude/agents" "$ROOT/.claude"
+}
+
+prune_empty() {
+    prune_cursor
+    prune_claude
 }
 
 if [ "$MODE" = "unlink" ]; then
@@ -308,28 +378,11 @@ PY
 refresh_exclude_root() {
     git_root=$1
     shift
-    exclude=$git_root/.git/info/exclude
-    if [ ! -d "$git_root/.git" ]; then
-        return 0
+    if [ "$MODE" = "unlink" ]; then
+        python3 "$REVIEWER/install/exclude-block.py" "$git_root" unlink
+    else
+        python3 "$REVIEWER/install/exclude-block.py" "$git_root" install "$@"
     fi
-    mkdir -p "$git_root/.git/info"
-    [ -f "$exclude" ] || : > "$exclude"
-    tmp=$(mktemp)
-    awk '
-        $0 == "# >>> merge-reviewer" { skip = 1; next }
-        $0 == "# <<< merge-reviewer" { skip = 0; next }
-        skip == 0 { print }
-    ' "$exclude" > "$tmp"
-    if [ "$MODE" != "unlink" ]; then
-        {
-            printf '%s\n' "# >>> merge-reviewer"
-            for rel in "$@"; do
-                printf '%s\n' "$rel"
-            done
-            printf '%s\n' "# <<< merge-reviewer"
-        } >> "$tmp"
-    fi
-    mv "$tmp" "$exclude"
 }
 
 rel_to() {
@@ -346,7 +399,7 @@ sync_workspace_triggers() {
             kind=${spec#* }
             write_trigger_file "$dir/$name" "$kind" "$dir/$name"
         done
-        if [ "$MODE" = "check" ]; then
+        if [ "$MODE" = "check" ] || [ "$SYNC_EXCLUDE" -eq 0 ]; then
             continue
         fi
         top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)
@@ -405,20 +458,69 @@ write_trigger_file() {
     printf '%s %s\n' "ok" "$label"
 }
 
-sync_workspace_triggers
+SYNC_EXCLUDE=1
+if host_has cursor || [ "$MODE" = "unlink" ]; then
+    sync_workspace_triggers
+elif [ "$MODE" = "install" ]; then
+    # Host without Cursor: drop trigger files mirrored beside a workspace file.
+    MODE=unlink
+    SYNC_EXCLUDE=0
+    sync_workspace_triggers
+    MODE=install
+    SYNC_EXCLUDE=1
+fi
+
+# Claude Code hooks live in .claude/settings.local.json (laptop-only). The tagged
+# entries are merged in or removed; settings.json is never touched.
+claude_hooks() {
+    helper=$REVIEWER/install/claude-settings.py
+    case "$MODE" in
+        unlink)
+            python3 "$helper" "$ROOT" remove "$REVIEWER" || true
+            ;;
+        check)
+            if host_has claude; then
+                python3 "$helper" "$ROOT" check "$REVIEWER" || PROBLEMS=$((PROBLEMS + 1))
+            elif python3 "$helper" "$ROOT" check "$REVIEWER" >/dev/null 2>&1; then
+                printf '%s %s\n' "stale" ".claude/settings.local.json"
+                PROBLEMS=$((PROBLEMS + 1))
+            fi
+            ;;
+        *)
+            if host_has claude; then
+                python3 "$helper" "$ROOT" install "$REVIEWER" || PROBLEMS=$((PROBLEMS + 1))
+            else
+                python3 "$helper" "$ROOT" remove "$REVIEWER" || true
+            fi
+            ;;
+    esac
+}
+
+claude_hooks
+
+if [ "$MODE" = "install" ]; then
+    # Only the dropped host's directories, and only when empty.
+    host_has cursor || prune_cursor
+    host_has claude || prune_claude
+elif [ "$MODE" = "unlink" ]; then
+    prune_empty
+fi
 if [ "$MODE" != "check" ]; then
     refresh_exclude
 fi
 
 if [ "$MODE" = "check" ]; then
+    printf '%s %s\n' "host:" "$HOST"
     python3 - "$REVIEWER" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
-from engine.project import is_opted_out
+from engine.project import configured_review_host, is_opted_out, load_review_project
 
-print("opted_out:", "yes" if is_opted_out(Path(sys.argv[2])) else "no")
+root = Path(sys.argv[2])
+print("review_host:", configured_review_host(load_review_project(root)))
+print("opted_out:", "yes" if is_opted_out(root) else "no")
 PY
 fi
 
